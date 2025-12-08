@@ -1,44 +1,59 @@
-from fastapi import FastAPI, UploadFile, File, Form
-import zipfile
-import io
-import base64
-import mimetypes
-import os
+from fastapi import FastAPI, HTTPException
+import requests, zipfile, tempfile, os, uuid
 
 app = FastAPI()
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+@app.post("/unzip_local")
+def unzip_local_files(payload: dict):
 
-@app.post("/unzip")
-async def unzip_file(
-    file: UploadFile = File(...),
-    images_only: bool = Form(False)
-):
-    contents = await file.read()
-    zip_bytes = io.BytesIO(contents)
+    files = payload.get("files", [])
+    if not files:
+        raise HTTPException(400, "files array is required")
 
-    result = []
+    job_id = str(uuid.uuid4())
+    work_dir = os.path.join(tempfile.gettempdir(), job_id)
+    os.makedirs(work_dir, exist_ok=True)
 
-    try:
-        with zipfile.ZipFile(zip_bytes, "r") as z:
-            for name in z.namelist():
-                if name.endswith("/"):
-                    continue
+    all_images = []
 
-                ext = os.path.splitext(name)[1].lower()
-                if images_only and ext not in IMAGE_EXTS:
-                    continue
+    for f in files:
+        url = f.get("out_url")  # ✅ this is how we access the LOCAL GET file
+        name = f.get("filename", "input.zip")
 
-                data = z.read(name)
-                mime, _ = mimetypes.guess_type(name)
+        if not url:
+            continue
 
-                result.append({
-                    "filename": name,
-                    "mime_type": mime or "application/octet-stream",
-                    "base64": base64.b64encode(data).decode("utf-8")
-                })
+        local_zip_path = os.path.join(work_dir, name)
 
-        return {"files": result}
+        # ✅ Download the LOCAL Dify file (tool storage)
+        try:
+            with requests.get(url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(local_zip_path, "wb") as wf:
+                    for chunk in r.iter_content(1024 * 1024):
+                        if chunk:
+                            wf.write(chunk)
+        except Exception as e:
+            raise HTTPException(400, f"Local file fetch failed: {str(e)}")
 
-    except zipfile.BadZipFile:
-        return {"error": "Invalid ZIP file"}
+        # ✅ Unzip
+        unzip_dir = os.path.join(work_dir, "unzipped")
+        os.makedirs(unzip_dir, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(local_zip_path, "r") as z:
+                z.extractall(unzip_dir)
+        except Exception as e:
+            raise HTTPException(400, f"Unzip failed: {str(e)}")
+
+        # ✅ Collect images
+        for root, _, fs in os.walk(unzip_dir):
+            for img in fs:
+                if img.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    all_images.append(os.path.join(root, img))
+
+    return {
+        "folder": work_dir,
+        "count": len(all_images),
+        "files_array": all_images
+    }
