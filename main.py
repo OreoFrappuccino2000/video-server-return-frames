@@ -1,5 +1,5 @@
 import hashlib
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 import subprocess
 import os
@@ -10,44 +10,21 @@ app = FastAPI()
 
 FILES_ROOT = "/app/files"
 CACHE_ROOT = "/tmp/cache"
-
 os.makedirs(FILES_ROOT, exist_ok=True)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
 MAX_FRAMES = 20
-BASE_URL = "https://video-server-return-frames-production.up.railway.app"
+BASE_URL = "https://videoserver-production.up.railway.app"
 
 
 @app.post("/run")
-def run(
-    video_url_query: str | None = Query(default=None),
-    body: dict = Body(default={})
-):
-    """
-    Accepts video_url from:
-    ✅ Query param
-    ✅ JSON body
-    Automatically sanitises newline + spaces.
-    """
-
-    # ✅ 1️⃣ PICK VIDEO URL FROM QUERY OR BODY
-    video_url = video_url_query or body.get("video_url")
-
-    if not video_url:
-        raise HTTPException(400, "video_url is required")
-
-    # ✅ 2️⃣ HARD SANITISE (PERMANENT FIX FOR '\n' ERROR)
-    video_url = (
-        video_url
-        .replace("\n", "")
-        .replace("\r", "")
-        .strip()
-    )
+def run(video_url: str):
+    video_url = video_url.strip()
 
     # --------------------------------------------------
-    # ✅ 3️⃣ CACHE KEY
+    # ✅ 0️⃣ HASH KEY FOR CACHING
     # --------------------------------------------------
     video_hash = hashlib.md5(video_url.encode()).hexdigest()
     cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
@@ -57,7 +34,7 @@ def run(
     os.makedirs(job_dir, exist_ok=True)
 
     # --------------------------------------------------
-    # ✅ 4️⃣ DOWNLOAD VIDEO (WITH REDIRECTS)
+    # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
     # --------------------------------------------------
     video_cached = os.path.exists(cached_video_path)
 
@@ -79,30 +56,21 @@ def run(
 
     video_path = cached_video_path
 
-    # ✅ BLOCK INVALID DOWNLOADS (HTML, empty, error pages)
-    if not os.path.exists(video_path) or os.path.getsize(video_path) < 1024 * 50:
-        raise HTTPException(
-            400,
-            "Downloaded file is not a valid video (too small or missing)"
-        )
-
     # --------------------------------------------------
-    # ✅ 5️⃣ PROBE DURATION
+    # ✅ 2️⃣ PROBE DURATION
     # --------------------------------------------------
     try:
-        duration = float(
-            subprocess.check_output([
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=nk=1:nw=1",
-                video_path
-            ]).decode().strip()
-        )
-    except Exception:
-        raise HTTPException(400, "Failed to probe video using ffprobe")
+        duration = float(subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nk=1:nw=1",
+            video_path
+        ]).decode().strip())
+    except:
+        raise HTTPException(400, "Failed to probe video")
 
     # --------------------------------------------------
-    # ✅ 6️⃣ SMART PHASE SAMPLING
+    # ✅ 3️⃣ SMART PHASE SAMPLING (ONLY IF NOT DONE)
     # --------------------------------------------------
     phases = {
         "early": (0.05, 0.25),
@@ -119,7 +87,7 @@ def run(
         phase_dir = os.path.join(job_dir, phase)
         os.makedirs(phase_dir, exist_ok=True)
 
-        # Extract only if missing
+        # ✅ Skip extraction if frames already exist
         if not os.listdir(phase_dir):
             frames_cached = False
 
@@ -139,14 +107,13 @@ def run(
             subprocess.run(ffmpeg_cmd, check=True)
 
         for f in sorted(os.listdir(phase_dir)):
-            frame_urls.append(
-                f"{BASE_URL}/files/{job_id}/{phase}/{f}"
-            )
+            url = f"{BASE_URL}/files/{job_id}/{phase}/{f}"
+            frame_urls.append(url)
 
     frame_urls = frame_urls[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # ✅ 7️⃣ FINAL RESPONSE (FRAMES ONLY, NO ZIP)
+    # ✅ 4️⃣ FINAL RESPONSE (NO ZIP — DIRECT FRAME URLS)
     # --------------------------------------------------
     return {
         "job_id": job_id,
