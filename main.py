@@ -2,22 +2,21 @@ import hashlib
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 import subprocess
-import uuid
 import os
 import math
 import requests
-import zipfile
 
 app = FastAPI()
 
 FILES_ROOT = "/app/files"
-CACHE_ROOT = "/tmp/cache"   # ✅ cache directory
+CACHE_ROOT = "/tmp/cache"
 os.makedirs(FILES_ROOT, exist_ok=True)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
 MAX_FRAMES = 20
+BASE_URL = "https://videoserver-production.up.railway.app"   # ✅ CHANGE ONLY IF DOMAIN CHANGES
 
 
 @app.post("/run")
@@ -28,30 +27,20 @@ def run(video_url: str):
     # ✅ 0️⃣ HASH KEY FOR CACHING
     # --------------------------------------------------
     video_hash = hashlib.md5(video_url.encode()).hexdigest()
-
     cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
-    cached_zip_path   = os.path.join(FILES_ROOT, f"{video_hash}.zip")
 
-    # ✅ If final ZIP already exists → return immediately
-    if os.path.exists(cached_zip_path):
-        BASE_URL = "https://videoserver-production.up.railway.app"
-        zip_url = f"{BASE_URL}/files/{video_hash}.zip"
-
-        return {
-            "job_id": video_hash,
-            "duration": 0,
-            "total_frames": MAX_FRAMES,
-            "frame_urls": [],
-            "zip_file": zip_url,
-            "cached": True
-        }
+    job_id = video_hash
+    job_dir = os.path.join(FILES_ROOT, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
     # --------------------------------------------------
     # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
     # --------------------------------------------------
-    if not os.path.exists(cached_video_path):
+    video_cached = os.path.exists(cached_video_path)
+
+    if not video_cached:
         try:
-            with requests.get(video_url, stream=True, timeout=120) as r:
+            with requests.get(video_url, stream=True, timeout=120, allow_redirects=True) as r:
                 r.raise_for_status()
                 with open(cached_video_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -61,12 +50,9 @@ def run(video_url: str):
             raise HTTPException(400, f"Failed to download video: {e}")
 
     video_path = cached_video_path
-    job_id = video_hash
-    job_dir = os.path.join(FILES_ROOT, job_id)
-    os.makedirs(job_dir, exist_ok=True)
 
     # --------------------------------------------------
-    # ✅ 2️⃣ PROBE DURATION (ONCE PER VIDEO)
+    # ✅ 2️⃣ PROBE DURATION
     # --------------------------------------------------
     try:
         duration = float(subprocess.check_output([
@@ -79,7 +65,7 @@ def run(video_url: str):
         raise HTTPException(400, "Failed to probe video")
 
     # --------------------------------------------------
-    # ✅ 3️⃣ SMART PHASE SAMPLING (ONLY IF NOT DONE)
+    # ✅ 3️⃣ SMART PHASE SAMPLING
     # --------------------------------------------------
     phases = {
         "early": (0.05, 0.25),
@@ -90,13 +76,16 @@ def run(video_url: str):
 
     frame_urls = []
     frames_per_phase = math.ceil(MAX_FRAMES / len(phases))
+    frames_cached = True
 
     for phase, (start_r, end_r) in phases.items():
         phase_dir = os.path.join(job_dir, phase)
         os.makedirs(phase_dir, exist_ok=True)
 
-        # ✅ Skip extraction if frames already exist
+        # ✅ Only extract if missing
         if not os.listdir(phase_dir):
+            frames_cached = False
+
             start_t = duration * start_r
             end_t = duration * end_r
             interval = max((end_t - start_t) / frames_per_phase, 1)
@@ -113,18 +102,18 @@ def run(video_url: str):
             subprocess.run(ffmpeg_cmd, check=True)
 
         for f in sorted(os.listdir(phase_dir)):
-            url = f"/files/{job_id}/{phase}/{f}"
+            url = f"{BASE_URL}/files/{job_id}/{phase}/{f}"   # ✅ ABSOLUTE DOWNLOAD URL
             frame_urls.append(url)
 
     frame_urls = frame_urls[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # ✅ 5️⃣ FINAL RESPONSE
+    # ✅ 4️⃣ FINAL RESPONSE (DIRECT DOWNLOADABLE FRAME URLS)
     # --------------------------------------------------
     return {
         "job_id": job_id,
         "duration": duration,
         "total_frames": len(frame_urls),
         "frame_urls": frame_urls,
-        "cached": False
+        "cached": video_cached and frames_cached
     }
