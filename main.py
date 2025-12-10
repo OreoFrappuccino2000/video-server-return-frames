@@ -148,43 +148,71 @@ def run(video_url: str):
             t = duration * (i + 1) / (visual_count + 1)
             visual_event_times.append(t)
 
-    # --------------------------------------------------
-    # ✅ 4️⃣ MERGE & CLAMP EVENT TIMES
-    # --------------------------------------------------
-    all_event_times = sorted(set(visual_event_times + audio_event_times))
+   # --------------------------------------------------
+# ✅ 4️⃣ INTELLIGENT TIME SCHEDULER (SPACED + WEIGHTED)
+# --------------------------------------------------
 
-    epsilon = 0.1
-    safe_times = []
-    for t in all_event_times:
-        if t < 0:
-            continue
-        if t > duration - epsilon:
-            t = duration - epsilon
-        safe_times.append(t)
+# ---- A) BASELINE EVEN COVERAGE (50%)
+baseline_slots = MAX_FRAMES // 2
+baseline_times = [
+    duration * (i + 1) / (baseline_slots + 1)
+    for i in range(baseline_slots)
+]
 
-    if not safe_times:
-        safe_times = [duration / 2.0]
+# ---- B) EVENT-FOCUSED DENSITY (50%)
+event_slots = MAX_FRAMES - baseline_slots
 
-    safe_times = safe_times[:MAX_FRAMES]
+# Prioritise both visual & audio events
+priority_events = sorted(set(visual_event_times + audio_event_times))
 
-    # --------------------------------------------------
-    # ✅ 5️⃣ HIGH-FPS BURST EXTRACTION (LOSSLESS PNG)
-    # --------------------------------------------------
-    if not os.listdir(burst_dir):
-        for i, t in enumerate(safe_times):
-            start = max(0, t - BURST_SECONDS / 2.0)
-            burst_pattern = os.path.join(
-                burst_dir, f"burst_{i:03d}_%03d.{IMAGE_EXT}"
-            )
+# If too many events, spread them proportionally
+if priority_events:
+    step = max(1, len(priority_events) // event_slots)
+    dense_times = priority_events[::step][:event_slots]
+else:
+    dense_times = []
 
-            safe_run([
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-i", video_path,
-                "-t", str(BURST_SECONDS),
-                "-vf", f"fps={BURST_FPS}",
-                burst_pattern
-            ])
+# ---- C) MICRO-BURSTS AROUND EACH EVENT (±0.6s)
+expanded_dense_times = []
+for t in dense_times:
+    for offset in (-0.6, 0.0, 0.6):
+        expanded_dense_times.append(t + offset)
+
+# ---- D) MERGE + CLAMP + DEDUPE
+all_times = baseline_times + expanded_dense_times
+
+safe_times = []
+epsilon = 0.1
+for t in sorted(all_times):
+    if 0 <= t <= duration - epsilon:
+        safe_times.append(round(t, 2))
+
+safe_times = sorted(set(safe_times))
+
+# ---- E) FINAL 20 MAX GUARANTEE
+safe_times = safe_times[:MAX_FRAMES]
+
+
+   # --------------------------------------------------
+# ✅ 5️⃣ FRAME EXTRACTION AT SCHEDULED TIMES (PNG)
+# --------------------------------------------------
+if not os.listdir(burst_dir):
+
+    for i, t in enumerate(safe_times):
+
+        burst_path = os.path.join(
+            burst_dir, f"frame_{i:03d}.{IMAGE_EXT}"
+        )
+
+        # Single-frame precise extraction (no blur, no duplicates)
+        safe_run([
+            "ffmpeg", "-y",
+            "-ss", str(t),
+            "-i", video_path,
+            "-frames:v", "1",
+            burst_path
+        ])
+
 
     # --------------------------------------------------
     # ✅ 6️⃣ SAFETY FALLBACK (LOSSLESS PNG)
