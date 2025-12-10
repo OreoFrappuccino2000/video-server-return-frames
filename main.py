@@ -12,255 +12,90 @@ app = FastAPI()
 # --------------------------------------------------
 FILES_ROOT = "/app/files"
 CACHE_ROOT = "/tmp/cache"
-BASE_URL = "https://video-server-return-frames-production.up.railway.app"
-
-MAX_FRAMES = 20
-SCENE_THRESHOLD = 0.35
-AUDIO_DB_THRESHOLD = -10
-
-# ✅ LOSSLESS IMAGE FORMAT
-IMAGE_EXT = "png"   # TRUE LOSSLESS OUTPUT
 
 os.makedirs(FILES_ROOT, exist_ok=True)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
-
-def safe_run(cmd: list):
-    """Run ffmpeg/ffprobe safely and convert errors to HTTP 400."""
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(400, f"ffmpeg failed: {e}")
+MAX_FRAMES = 20
+BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
 
 @app.post("/run")
 def run(video_url: str):
-    video_url = video_url.strip()
-
-    # --------------------------------------------------
-    # ✅ 0️⃣ HASH + FOLDERS
-    # --------------------------------------------------
-    video_hash = hashlib.md5(video_url.encode()).hexdigest()
-    job_id = video_hash
-
-    job_dir = os.path.join(FILES_ROOT, job_id)
-    scene_dir = os.path.join(job_dir, "scenes")
-    burst_dir = os.path.join(job_dir, "bursts")
-    fallback_dir = os.path.join(job_dir, "fallback")
-
-    for d in [job_dir, scene_dir, burst_dir, fallback_dir]:
-        os.makedirs(d, exist_ok=True)
-
-    cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
-
+@@ -34,9 +37,11 @@ def run(video_url: str):
     # --------------------------------------------------
     # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
     # --------------------------------------------------
+    if not os.path.exists(cached_video_path):
     video_cached = os.path.exists(cached_video_path)
 
     if not video_cached:
         try:
-            with requests.get(video_url, stream=True, timeout=180) as r:
+            with requests.get(video_url, stream=True, timeout=120) as r:
+            with requests.get(video_url, stream=True, timeout=120, allow_redirects=True) as r:
                 r.raise_for_status()
                 with open(cached_video_path, "wb") as f:
-                    for chunk in r.iter_content(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-        except Exception as e:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+@@ -46,9 +51,6 @@ def run(video_url: str):
             raise HTTPException(400, f"Failed to download video: {e}")
 
     video_path = cached_video_path
+    job_id = video_hash
+    job_dir = os.path.join(FILES_ROOT, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
     # --------------------------------------------------
     # ✅ 2️⃣ PROBE DURATION
-    # --------------------------------------------------
-    try:
-        duration = float(subprocess.check_output([
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=nk=1:nw=1",
-            video_path
-        ]).decode().strip())
-    except:
-        raise HTTPException(400, "Failed to probe duration")
-
-    if duration <= 0:
-        raise HTTPException(400, "Invalid video duration")
+@@ -64,9 +66,9 @@ def run(video_url: str):
+        raise HTTPException(400, "Failed to probe video")
 
     # --------------------------------------------------
-    # ✅ 2.5️⃣ OPTIONAL AUDIO PEAK DETECTION (SAFE)
+    # ✅ 3️⃣ SMART PHASE SAMPLING
+    # ✅ 3️⃣ SMART PHASE SAMPLING  ✅ FIXED INDENT
     # --------------------------------------------------
-    audio_event_times = []
-    try:
-        audio_cmd = [
-            "ffmpeg", "-i", video_path,
-            "-af", "astats,ametadata=print:key=lavfi.astats.Overall.Peak_level",
-            "-f", "null", "-"
-        ]
+     phases = {
+    phases = {
+        "early": (0.05, 0.25),
+        "mid":   (0.35, 0.60),
+        "late":  (0.70, 0.90),
+@@ -75,13 +77,15 @@ def run(video_url: str):
 
-        proc = subprocess.Popen(
-            audio_cmd,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            text=True
-        )
+    frame_urls = []
+    frames_per_phase = math.ceil(MAX_FRAMES / len(phases))
+    frames_cached = True
 
-        peak_indices = []
-        for idx, line in enumerate(proc.stderr):
-            if "Peak level dB" in line:
-                try:
-                    db = float(line.strip().split(":")[-1])
-                    if db > AUDIO_DB_THRESHOLD:
-                        peak_indices.append(idx)
-                except:
-                    pass
+    for phase, (start_r, end_r) in phases.items():
+        phase_dir = os.path.join(job_dir, phase)
+        os.makedirs(phase_dir, exist_ok=True)
 
-        n_peaks = min(len(peak_indices), MAX_FRAMES // 2)
-        if n_peaks > 0:
-            for i in range(n_peaks):
-                # spread loud events roughly across duration
-                t = duration * (i + 1) / (n_peaks + 1)
-                audio_event_times.append(t)
+        # ✅ Skip extraction if frames already exist
+        if not os.listdir(phase_dir):
+            frames_cached = False
 
-    except Exception:
-        audio_event_times = []
+            start_t = duration * start_r
+            end_t = duration * end_r
+            interval = max((end_t - start_t) / frames_per_phase, 1)
+@@ -98,18 +102,18 @@ def run(video_url: str):
+            subprocess.run(ffmpeg_cmd, check=True)
+
+        for f in sorted(os.listdir(phase_dir)):
+            url = f"/files/{job_id}/{phase}/{f}"
+            url = f"{BASE_URL}/files/{job_id}/{phase}/{f}"
+            frame_urls.append(url)
+
+    frame_urls = frame_urls[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # ✅ 3️⃣ VISUAL SCENE DETECTION (PNG)
+    # ✅ 4️⃣ FINAL RESPONSE (DIRECT DOWNLOADABLE FRAME URLS)
+    # ✅ 4️⃣ FINAL RESPONSE (DIRECT DOWNLOADABLE URLs)
     # --------------------------------------------------
-    if not os.listdir(scene_dir):
-        safe_run([
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vf", f"select='gt(scene,{SCENE_THRESHOLD})'",
-            "-vsync", "vfr",
-            f"{scene_dir}/scene_%04d.{IMAGE_EXT}"
-        ])
-
-    visual_files = sorted(os.listdir(scene_dir))
-    visual_count = len(visual_files)
-
-    visual_event_times = []
-    if visual_count > 0:
-        for i in range(visual_count):
-            # spread scenes across duration
-            t = duration * (i + 1) / (visual_count + 1)
-            visual_event_times.append(t)
-
-    # --------------------------------------------------
-    # ✅ 4️⃣ INTELLIGENT TIME SCHEDULER (SPACED + WEIGHTED, FORCE 20)
-    # --------------------------------------------------
-    
-    # A) BASELINE EVEN COVERAGE (50%)
-    baseline_slots = MAX_FRAMES // 2
-    baseline_times = [
-        duration * (i + 1) / (baseline_slots + 1)
-        for i in range(baseline_slots)
-    ]
-
-    # B) EVENT-FOCUSED DENSITY (50%)
-    event_slots = MAX_FRAMES - baseline_slots
-    priority_events = sorted(set(visual_event_times + audio_event_times))
-    
-    if priority_events and event_slots > 0:
-        step = max(1, len(priority_events) // event_slots)
-        dense_times = priority_events[::step][:event_slots]
-    else:
-        dense_times = []
-
-    # C) MICRO-BURSTS AROUND EACH EVENT (±0.6s)
-    expanded_dense_times = []
-    for t in dense_times:
-        for offset in (-0.6, 0.0, 0.6):
-            expanded_dense_times.append(t + offset)
-
-    # D) MERGE + CLAMP + DEDUPE
-    all_times = baseline_times + expanded_dense_times
-
-    epsilon = 0.05
-    safe_times = []
-    for t in sorted(all_times):
-        if 0 <= t <= duration - epsilon:
-            safe_times.append(round(t, 2))
-
-    safe_times = sorted(set(safe_times))
-
-    # --------------------------------------------------
-    # ✅ E) FORCE EXACTLY 20 FRAMES (FILL IF SHORT)
-    # --------------------------------------------------
-    if len(safe_times) < MAX_FRAMES:
-        needed = MAX_FRAMES - len(safe_times)
-    
-        filler_times = [
-            duration * (i + 1) / (needed + 1)
-            for i in range(needed)
-        ]
-
-        safe_times += filler_times
-        safe_times = sorted(set(round(t, 2) for t in safe_times))
-
-    # Final hard cap — ALWAYS EXACTLY 20
-    safe_times = safe_times[:MAX_FRAMES]
-
-    # Safety fallback if still somehow broken
-    if len(safe_times) < MAX_FRAMES:
-        safe_times = [
-            round(duration * (i + 1) / (MAX_FRAMES + 1), 2)
-            for i in range(MAX_FRAMES)
-        ]
-
-
-    # --------------------------------------------------
-    # ✅ 5️⃣ FRAME EXTRACTION AT SCHEDULED TIMES (EXACTLY 20)
-    # --------------------------------------------------
-    if not os.listdir(burst_dir):
-
-        for i in range(MAX_FRAMES):
-            t = safe_times[i]
-    
-            burst_path = os.path.join(
-                burst_dir, f"frame_{i:03d}.{IMAGE_EXT}"
-            )
-    
-            safe_run([
-                "ffmpeg", "-y",
-                "-ss", str(t),
-                "-i", video_path,
-                "-frames:v", "1",
-                burst_path
-            ])
-
-
-    # --------------------------------------------------
-    # ✅ 6️⃣ SAFETY FALLBACK (LOSSLESS PNG)
-    # --------------------------------------------------
-    if not os.listdir(burst_dir):
-        interval = max(duration / MAX_FRAMES, 2.0)
-        safe_run([
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vf", f"fps=1/{interval}",
-            "-frames:v", str(MAX_FRAMES),
-            f"{fallback_dir}/fallback_%03d.{IMAGE_EXT}"
-        ])
-        active_dir = fallback_dir
-    else:
-        active_dir = burst_dir
-
-    # --------------------------------------------------
-    # ✅ 7️⃣ FINAL URL RESPONSE
-    # --------------------------------------------------
-    frame_urls = [
-        f"{BASE_URL}/files/{job_id}/{os.path.basename(active_dir)}/{f}"
-        for f in sorted(os.listdir(active_dir))
-    ][:MAX_FRAMES]
-
     return {
         "job_id": job_id,
         "duration": duration,
         "total_frames": len(frame_urls),
         "frame_urls": frame_urls,
-        "cached": video_cached
+        "cached": False
+        "cached": video_cached and frames_cached
     }
