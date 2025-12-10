@@ -14,11 +14,15 @@ FILES_ROOT = "/app/files"
 CACHE_ROOT = "/tmp/cache"
 BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
-MAX_FRAMES = 20               # total frames to return
-SCENE_THRESHOLD = 0.35        # sensitivity of scene detection
-BURST_FPS = 8                 # frames per second inside each burst
-BURST_SECONDS = 2.5           # duration of each burst window
-AUDIO_DB_THRESHOLD = -10      # loudness threshold for "hype" audio
+MAX_FRAMES = 20
+SCENE_THRESHOLD = 0.35
+BURST_FPS = 8
+BURST_SECONDS = 2.5
+AUDIO_DB_THRESHOLD = -10
+
+# ✅ IMAGE QUALITY SETTINGS (CRITICAL)
+JPG_QUALITY = "2"          # 2 = visually lossless, 31 = worst
+JPG_PIXEL_FORMAT = "yuvj420p"  # full-range JPEG (prevents dull colors)
 
 os.makedirs(FILES_ROOT, exist_ok=True)
 os.makedirs(CACHE_ROOT, exist_ok=True)
@@ -27,7 +31,7 @@ app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
 
 def safe_run(cmd: list):
-    """Run ffmpeg/ffprobe commands and convert errors to HTTP 400."""
+    """Run ffmpeg/ffprobe safely."""
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
@@ -55,7 +59,7 @@ def run(video_url: str):
     cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
 
     # --------------------------------------------------
-    # ✅ 1️⃣ DOWNLOAD (CACHED)
+    # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
     # --------------------------------------------------
     video_cached = os.path.exists(cached_video_path)
 
@@ -86,12 +90,11 @@ def run(video_url: str):
         raise HTTPException(400, "Failed to probe duration")
 
     if duration <= 0:
-        raise HTTPException(400, "Video has invalid duration")
+        raise HTTPException(400, "Invalid video duration")
 
     # --------------------------------------------------
     # ✅ 2.5️⃣ OPTIONAL AUDIO PEAK DETECTION (SAFE)
     # --------------------------------------------------
-    # We only care about how MANY loud peaks there are, not exact timestamps.
     audio_event_times = []
     try:
         audio_cmd = [
@@ -117,37 +120,35 @@ def run(video_url: str):
                 except:
                     pass
 
-        # Map loud peaks evenly into the duration
         n_peaks = min(len(peak_indices), MAX_FRAMES // 2)
         if n_peaks > 0:
             for i in range(n_peaks):
                 t = duration * (i + 1) / (n_peaks + 1)
                 audio_event_times.append(t)
 
-    except Exception:
-        # No audio stream or analysis failed → just ignore audio hints
+    except:
         audio_event_times = []
 
     # --------------------------------------------------
-    # ✅ 3️⃣ VISUAL SCENE DETECTION (PRIMARY SIGNAL)
+    # ✅ 3️⃣ VISUAL SCENE DETECTION (HIGH QUALITY JPG)
     # --------------------------------------------------
     if not os.listdir(scene_dir):
         safe_run([
             "ffmpeg", "-y",
             "-i", video_path,
-            "-vf", f"select='gt(scene,{SCENE_THRESHOLD})',showinfo",
+            "-vf", f"select='gt(scene,{SCENE_THRESHOLD})'",
             "-vsync", "vfr",
+            "-q:v", JPG_QUALITY,
+            "-pix_fmt", JPG_PIXEL_FORMAT,
             f"{scene_dir}/scene_%04d.jpg"
         ])
 
     visual_files = sorted(os.listdir(scene_dir))
     visual_count = len(visual_files)
 
-    # Spread visual event times across duration based on count
     visual_event_times = []
     if visual_count > 0:
         for i in range(visual_count):
-            # From early to late game roughly
             t = duration * (i + 1) / (visual_count + 1)
             visual_event_times.append(t)
 
@@ -156,26 +157,22 @@ def run(video_url: str):
     # --------------------------------------------------
     all_event_times = sorted(set(visual_event_times + audio_event_times))
 
-    # Clamp all times into [0, duration - ε]
-    safe_times = []
     epsilon = 0.1
+    safe_times = []
     for t in all_event_times:
         if t < 0:
             continue
         if t > duration - epsilon:
-            t = max(0, duration - epsilon)
+            t = duration - epsilon
         safe_times.append(t)
 
-    # If we somehow still have no event times (very static, no audio),
-    # just center one event in the middle.
     if not safe_times:
         safe_times = [duration / 2.0]
 
-    # Limit number of bursts by MAX_FRAMES
     safe_times = safe_times[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # ✅ 5️⃣ HIGH-FPS BURST EXTRACTION AROUND EVENTS
+    # ✅ 5️⃣ HIGH-FPS BURST EXTRACTION (BEST JPG QUALITY)
     # --------------------------------------------------
     if not os.listdir(burst_dir):
         for i, t in enumerate(safe_times):
@@ -188,21 +185,27 @@ def run(video_url: str):
                 "-i", video_path,
                 "-t", str(BURST_SECONDS),
                 "-vf", f"fps={BURST_FPS}",
+                "-q:v", JPG_QUALITY,
+                "-pix_fmt", JPG_PIXEL_FORMAT,
                 burst_pattern
             ])
 
     # --------------------------------------------------
-    # ✅ 6️⃣ SAFETY FALLBACK (UNIFORM SAMPLING)
+    # ✅ 6️⃣ SAFETY FALLBACK (BEST JPG QUALITY)
     # --------------------------------------------------
     if not os.listdir(burst_dir):
         interval = max(duration / MAX_FRAMES, 2.0)
+
         safe_run([
             "ffmpeg", "-y",
             "-i", video_path,
             "-vf", f"fps=1/{interval}",
             "-frames:v", str(MAX_FRAMES),
+            "-q:v", JPG_QUALITY,
+            "-pix_fmt", JPG_PIXEL_FORMAT,
             f"{fallback_dir}/fallback_%03d.jpg"
         ])
+
         active_dir = fallback_dir
     else:
         active_dir = burst_dir
@@ -210,13 +213,10 @@ def run(video_url: str):
     # --------------------------------------------------
     # ✅ 7️⃣ FINAL URL RESPONSE
     # --------------------------------------------------
-    frame_urls = []
-    for f in sorted(os.listdir(active_dir)):
-        frame_urls.append(
-            f"{BASE_URL}/files/{job_id}/{os.path.basename(active_dir)}/{f}"
-        )
-
-    frame_urls = frame_urls[:MAX_FRAMES]
+    frame_urls = [
+        f"{BASE_URL}/files/{job_id}/{os.path.basename(active_dir)}/{f}"
+        for f in sorted(os.listdir(active_dir))
+    ][:MAX_FRAMES]
 
     return {
         "job_id": job_id,
