@@ -19,7 +19,7 @@ app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-MAX_FRAMES = 14   # 🔒 HARD FRAME CAP
+MAX_FRAMES = 10   # 🔒 HARD FRAME CAP
 BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
 # --------------------------------------------------
