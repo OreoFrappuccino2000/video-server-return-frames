@@ -1,10 +1,10 @@
 import hashlib
-import math
-import os
-import subprocess
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+import subprocess
+import os
+import math
+import requests
 
 app = FastAPI()
 
@@ -16,21 +16,16 @@ os.makedirs(CACHE_ROOT, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
-MAX_FRAMES = 10   # 🔒 HARD FRAME CAP
+MAX_FRAMES = 18
 BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
-# --------------------------------------------------
-# API
-# --------------------------------------------------
+
 @app.post("/run")
 def run(video_url: str):
     video_url = video_url.strip()
 
     # --------------------------------------------------
-    # 0️⃣ HASH KEY FOR CACHING
+    # ✅ 0️⃣ HASH KEY FOR CACHING
     # --------------------------------------------------
     video_hash = hashlib.md5(video_url.encode()).hexdigest()
     cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
@@ -40,45 +35,38 @@ def run(video_url: str):
     os.makedirs(job_dir, exist_ok=True)
 
     # --------------------------------------------------
-    # 1️⃣ VIDEO DOWNLOAD (CACHED)
+    # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
     # --------------------------------------------------
     video_cached = os.path.exists(cached_video_path)
 
     if not video_cached:
         try:
-            with requests.get(
-                video_url,
-                stream=True,
-                timeout=120,
-                allow_redirects=True
-            ) as r:
+            with requests.get(video_url, stream=True, timeout=120, allow_redirects=True) as r:
                 r.raise_for_status()
                 with open(cached_video_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             f.write(chunk)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to download video: {e}")
+            raise HTTPException(400, f"Failed to download video: {e}")
 
     video_path = cached_video_path
 
     # --------------------------------------------------
-    # 2️⃣ PROBE DURATION
+    # ✅ 2️⃣ PROBE DURATION
     # --------------------------------------------------
     try:
-        duration = float(
-            subprocess.check_output([
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=nk=1:nw=1",
-                video_path
-            ]).decode().strip()
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to probe video duration")
+        duration = float(subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nk=1:nw=1",
+            video_path
+        ]).decode().strip())
+    except:
+        raise HTTPException(400, "Failed to probe video")
 
     # --------------------------------------------------
-    # 3️⃣ SMART PHASE SAMPLING
+    # ✅ 3️⃣ SMART PHASE SAMPLING  ✅ FIXED INDENT
     # --------------------------------------------------
     phases = {
         "early": (0.05, 0.25),
@@ -95,8 +83,7 @@ def run(video_url: str):
         phase_dir = os.path.join(job_dir, phase)
         os.makedirs(phase_dir, exist_ok=True)
 
-        existing_frames = sorted(os.listdir(phase_dir))
-        if len(existing_frames) < frames_per_phase:
+        if not os.listdir(phase_dir):
             frames_cached = False
 
             start_t = duration * start_r
@@ -115,17 +102,13 @@ def run(video_url: str):
             subprocess.run(ffmpeg_cmd, check=True)
 
         for f in sorted(os.listdir(phase_dir)):
-            frame_urls.append(
-                f"{BASE_URL}/files/{job_id}/{phase}/{f}"
-            )
+            url = f"{BASE_URL}/files/{job_id}/{phase}/{f}"
+            frame_urls.append(url)
 
-    # --------------------------------------------------
-    # 4️⃣ FINAL TRIM (HARD CAP)
-    # --------------------------------------------------
     frame_urls = frame_urls[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # 5️⃣ RESPONSE
+    # ✅ 4️⃣ FINAL RESPONSE (DIRECT DOWNLOADABLE URLs)
     # --------------------------------------------------
     return {
         "job_id": job_id,
